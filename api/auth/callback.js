@@ -10,7 +10,7 @@ export default async function handler(req, res) {
     // Parse query params manually from URL (works in both Node.js and Edge)
     const url = new URL(
       req.url,
-      `https://${req.headers.host || "nolters-return-api.vercel.app"}`
+      `https://${req.headers.host || "sample-cart-return-api.vercel.app"}`
     );
     const code = url.searchParams.get("code");
     const shop = url.searchParams.get("shop");

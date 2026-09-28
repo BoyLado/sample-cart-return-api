@@ -14,7 +14,7 @@ export default function handler(req, res) {
   }
 
   const clientId = process.env.SHOPIFY_CLIENT_ID;
-  const redirectUri = "https://nolters-return-api.vercel.app/api/auth/callback";
+  const redirectUri = "https://sample-cart-return-api.vercel.app/api/auth/callback";
   const scopes = "read_orders"; // TODO: palitan ayon sa kailangan ng app mo
   const state = "some-random-string"; // ideally random per request
 
