@@ -336,6 +336,9 @@ const RETURNABLE_FULFILLMENTS_QUERY = `
 /**
  * Return request mutation.
  * Creates a return with REQUESTED status, pending approval.
+ *
+ * IMPORTANT: ReturnRequestLineItemInput does NOT support returnReasonNote.
+ * Use `customerNote` instead (max 300 chars per item).
  * @see https://shopify.dev/docs/api/admin-graphql/latest/mutations/returnRequest
  */
 const RETURN_REQUEST_MUTATION = `
@@ -358,7 +361,9 @@ const RETURN_REQUEST_MUTATION = `
 /**
  * Return approve request mutation.
  * Approves a REQUESTED return and triggers customer notification if notifyCustomer is true.
+ *
  * @see https://shopify.dev/docs/api/admin-graphql/latest/mutations/returnApproveRequest
+ * @see https://shopify.dev/changelog/notify-customers-when-their-return-requests-are-approved-or-declined
  */
 const RETURN_APPROVE_MUTATION = `
   mutation ReturnApproveRequest($input: ReturnApproveRequestInput!) {
@@ -471,25 +476,23 @@ function buildDeliveryMap(order) {
  *
  * @param {string} orderId - The Shopify Order GID.
  * @param {Array} returnLineItems - Array of items to return.
- * @param {string} [customerNote] - Optional note from the customer.
  * @returns {Promise<{ok: boolean, returnData?: object, autoApproved?: boolean, errors?: Array}>}
  */
-async function createAndApproveReturn(orderId, returnLineItems, customerNote) {
+async function createAndApproveReturn(orderId, returnLineItems) {
   // Step 1: Create the return request.
+  // IMPORTANT: ReturnRequestInput has no customerNote field at the root level.
+  // Each line item uses `customerNote` (max 300 chars) for per-item notes.
   const requestInput = {
     orderId,
     returnLineItems: returnLineItems.map((item) => ({
       fulfillmentLineItemId: item.fulfillmentLineItemId,
       quantity: item.quantity,
       returnReason: item.returnReason,
-      returnReasonNote: item.returnReasonNote || "",
+      // customerNote is optional per-item note (max 300 chars).
+      // If empty string, it's still valid.
+      customerNote: item.customerNote || "",
     })),
   };
-
-  // Add customerNote if provided.
-  if (customerNote) {
-    requestInput.customerNote = customerNote;
-  }
 
   console.log("Creating return request...");
   const requestData = await shopifyGraphQL(RETURN_REQUEST_MUTATION, {
@@ -518,6 +521,7 @@ async function createAndApproveReturn(orderId, returnLineItems, customerNote) {
 
   // Step 2: Approve the return request.
   // notifyCustomer: true triggers Shopify's native email notification.
+  // Notification is only sent if Order.email is present.
   console.log("Approving return request and notifying customer...");
   const approveData = await shopifyGraphQL(RETURN_APPROVE_MUTATION, {
     input: {
@@ -868,7 +872,6 @@ async function handleSubmit(res, body) {
 
   const deliveryMap = buildDeliveryMap(order);
   const returnLineItems = [];
-  const customerNotes = [];
 
   for (const requestedItem of items) {
     const match = returnable.find(
@@ -907,24 +910,21 @@ async function handleSubmit(res, body) {
       match.availableQuantity
     );
 
+    // Build line item input.
+    // customerNote is the per-item note field (max 300 chars).
     returnLineItems.push({
       fulfillmentLineItemId: match.fulfillmentLineItemId,
       quantity: qty,
       returnReason: mapReturnReason(requestedItem.reason),
-      returnReasonNote: requestedItem.note || "",
+      // Use `details` from frontend as customerNote.
+      // If absent, use empty string (valid, no note shown).
+      customerNote: (requestedItem.details || "").slice(0, 300),
     });
-
-    if (requestedItem.details) {
-      customerNotes.push(`${requestedItem.title}: ${requestedItem.details}`);
-    }
   }
-
-  // Combine customer notes if any exist.
-  const customerNote = customerNotes.length > 0 ? customerNotes.join("\n") : undefined;
 
   let result;
   try {
-    result = await createAndApproveReturn(order.id, returnLineItems, customerNote);
+    result = await createAndApproveReturn(order.id, returnLineItems);
   } catch (err) {
     console.error("Return creation/approval failed:", err);
     return sendJson(res, 500, {
