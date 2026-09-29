@@ -335,11 +335,6 @@ const RETURNABLE_FULFILLMENTS_QUERY = `
 
 /**
  * Return request mutation.
- * Creates a return with REQUESTED status, pending approval.
- *
- * IMPORTANT: ReturnRequestLineItemInput does NOT support returnReasonNote.
- * Use `customerNote` instead (max 300 chars per item).
- * @see https://shopify.dev/docs/api/admin-graphql/latest/mutations/returnRequest
  */
 const RETURN_REQUEST_MUTATION = `
   mutation ReturnRequest($input: ReturnRequestInput!) {
@@ -360,10 +355,6 @@ const RETURN_REQUEST_MUTATION = `
 
 /**
  * Return approve request mutation.
- * Approves a REQUESTED return and triggers customer notification if notifyCustomer is true.
- *
- * @see https://shopify.dev/docs/api/admin-graphql/latest/mutations/returnApproveRequest
- * @see https://shopify.dev/changelog/notify-customers-when-their-return-requests-are-approved-or-declined
  */
 const RETURN_APPROVE_MUTATION = `
   mutation ReturnApproveRequest($input: ReturnApproveRequestInput!) {
@@ -468,28 +459,14 @@ function buildDeliveryMap(order) {
 
 /**
  * Creates a return request and approves it, triggering Shopify's native notification.
- *
- * Workflow:
- * 1. returnRequest → creates a return with REQUESTED status.
- * 2. returnApproveRequest (notifyCustomer: true) → approves the return and sends
- *    a notification email to the customer (if Order.email is present).
- *
- * @param {string} orderId - The Shopify Order GID.
- * @param {Array} returnLineItems - Array of items to return.
- * @returns {Promise<{ok: boolean, returnData?: object, autoApproved?: boolean, errors?: Array}>}
  */
 async function createAndApproveReturn(orderId, returnLineItems) {
-  // Step 1: Create the return request.
-  // IMPORTANT: ReturnRequestInput has no customerNote field at the root level.
-  // Each line item uses `customerNote` (max 300 chars) for per-item notes.
   const requestInput = {
     orderId,
     returnLineItems: returnLineItems.map((item) => ({
       fulfillmentLineItemId: item.fulfillmentLineItemId,
       quantity: item.quantity,
       returnReason: item.returnReason,
-      // customerNote is optional per-item note (max 300 chars).
-      // If empty string, it's still valid.
       customerNote: item.customerNote || "",
     })),
   };
@@ -519,9 +496,6 @@ async function createAndApproveReturn(orderId, returnLineItems) {
     `Return request created — id: ${returnData.id}, name: ${returnData.name}, status: ${returnData.status}`
   );
 
-  // Step 2: Approve the return request.
-  // notifyCustomer: true triggers Shopify's native email notification.
-  // Notification is only sent if Order.email is present.
   console.log("Approving return request and notifying customer...");
   const approveData = await shopifyGraphQL(RETURN_APPROVE_MUTATION, {
     input: {
@@ -534,8 +508,6 @@ async function createAndApproveReturn(orderId, returnLineItems) {
   const approveErrors = approvePayload?.userErrors || [];
 
   if (approveErrors.length > 0) {
-    // Return was created successfully, but approval failed.
-    // Log the error, but don't fail the whole request.
     console.error(
       "AUTO-APPROVE FAILED:",
       JSON.stringify(approveErrors, null, 2)
@@ -564,6 +536,8 @@ async function createAndApproveReturn(orderId, returnLineItems) {
 
 /**
  * Send merchant notification email via Resend.
+ *
+ * Includes product image thumbnails for each returned item.
  */
 async function sendMerchantNotification({ order, returnData, items }) {
   console.log("=== sendMerchantNotification START ===");
@@ -582,22 +556,43 @@ async function sendMerchantNotification({ order, returnData, items }) {
   const orderLink = adminUrl ? `${adminUrl}/orders/${orderId}` : "";
   const returnName = returnData?.name || "Return";
 
+  // Build items table with image thumbnails.
   const itemsHtml = items
-    .map(
-      (i) => `
+    .map((i) => {
+      const imgUrl = i.image && i.image.url ? i.image.url : "";
+      const imgAlt = i.image && i.image.alt ? i.image.alt : (i.title || "");
+
+      const imgCell = imgUrl
+        ? `<img src="${escapeHtml(imgUrl)}" alt="${escapeHtml(imgAlt)}"
+             width="48" height="48"
+             style="display:block;width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #eee;" />`
+        : `<div style="width:48px;height:48px;background:#f0f0f0;border-radius:4px;border:1px solid #eee;"></div>`;
+
+      return `
         <tr>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${escapeHtml(i.title || "")}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">${escapeHtml(i.quantity)}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${escapeHtml(i.reason || "")}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${escapeHtml(i.note || "—")}</td>
-        </tr>`
-    )
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;width:56px;">
+            ${imgCell}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
+            ${escapeHtml(i.title || "")}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;text-align:center;font-size:14px;">
+            ${escapeHtml(i.quantity)}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
+            ${escapeHtml(i.reason || "")}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
+            ${escapeHtml(i.note || "—")}
+          </td>
+        </tr>`;
+    })
     .join("");
 
   const customerDisplay = order.email || "Customer";
 
   const html = `
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333;">
+    <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;color:#333;">
       <h2 style="margin:0 0 16px;">New return request (auto-approved)</h2>
       <p>
         A customer has submitted a return request for <strong>${escapeHtml(storeName)}</strong>.
@@ -623,6 +618,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
       <table style="width:100%;border-collapse:collapse;font-size:14px;">
         <thead>
           <tr style="background:#f5f5f5;">
+            <th style="padding:8px;text-align:left;width:56px;"></th>
             <th style="padding:8px;text-align:left;">Item</th>
             <th style="padding:8px;text-align:center;">Qty</th>
             <th style="padding:8px;text-align:left;">Reason</th>
@@ -872,6 +868,7 @@ async function handleSubmit(res, body) {
 
   const deliveryMap = buildDeliveryMap(order);
   const returnLineItems = [];
+  const enrichedItems = [];
 
   for (const requestedItem of items) {
     const match = returnable.find(
@@ -910,15 +907,17 @@ async function handleSubmit(res, body) {
       match.availableQuantity
     );
 
-    // Build line item input.
-    // customerNote is the per-item note field (max 300 chars).
     returnLineItems.push({
       fulfillmentLineItemId: match.fulfillmentLineItemId,
       quantity: qty,
       returnReason: mapReturnReason(requestedItem.reason),
-      // Use `details` from frontend as customerNote.
-      // If absent, use empty string (valid, no note shown).
       customerNote: (requestedItem.details || "").slice(0, 300),
+    });
+
+    // Enrich the item with the image from Shopify for the email.
+    enrichedItems.push({
+      ...requestedItem,
+      image: match.image || null,
     });
   }
 
@@ -943,11 +942,12 @@ async function handleSubmit(res, body) {
   console.log("Return created successfully:", result.returnData);
 
   // Notify merchant via Resend (non-blocking)
+  // Use enrichedItems so the email can render product image thumbnails.
   try {
     await sendMerchantNotification({
       order,
       returnData: result.returnData,
-      items,
+      items: enrichedItems,
     });
   } catch (err) {
     console.error("Merchant notification error:", err);
