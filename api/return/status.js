@@ -110,6 +110,18 @@ function escapeSearchValue(value) {
 }
 
 /**
+ * Escape HTML entities for safe email rendering.
+ */
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
  * Map frontend reason strings to Shopify ReturnReason enum.
  *
  * IMPORTANT: Shopify only accepts specific enum values.
@@ -381,29 +393,6 @@ const RETURN_CREATE_MUTATION = `
 `;
 
 /**
- * Return approve mutation — triggers customer notification.
- *
- * NOTE: Auto-approve is the default behavior for eligible returns
- * (within 7-day window, not final sale, not outside 48h damage window).
- * The eligibility is already checked before this mutation is called.
- */
-const RETURN_APPROVE_MUTATION = `
-  mutation ReturnApproveRequest($input: ReturnApproveRequestInput!) {
-    returnApproveRequest(input: $input) {
-      return {
-        id
-        name
-        status
-      }
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
-
-/**
  * ============================================================
  * CORE BUSINESS LOGIC
  * ============================================================
@@ -520,14 +509,23 @@ function buildDeliveryMap(order) {
 }
 
 /**
- * Create a Shopify return and auto-approve it.
+ * Create a Shopify return.
  *
- * Since eligible items are already filtered by the 7-day window
- * (and 48-hour damage window) before reaching this function,
- * we can safely auto-approve all returns here.
+ * IMPORTANT: API-initiated returns (via `returnCreate` mutation) are
+ * created with status "OPEN" — which means they are ALREADY approved.
  *
- * The customer will receive Shopify's native return confirmation
- * email (configured in Shopify Admin → Notifications).
+ * We do NOT call `returnApproveRequest` here, because that mutation only
+ * works on returns with status "REQUESTED" (those created via Shopify's
+ * native customer returns portal). Calling it on an "OPEN" return fails
+ * with: "Return is not approvable. Only returns with status REQUESTED
+ * can be approved."
+ *
+ * Since we've already validated eligibility (within 7-day window, not
+ * final sale, not outside 48h damage window) before calling this
+ * function, treating "OPEN" as auto-approved is correct.
+ *
+ * The customer notification email is sent separately via Resend
+ * (see `sendCustomerConfirmation`).
  */
 async function createShopifyReturn(orderId, returnLineItems) {
   const input = {
@@ -540,7 +538,7 @@ async function createShopifyReturn(orderId, returnLineItems) {
     })),
   };
 
-  // Step 1: Create the return
+  // Step 1: Create the return.
   const createData = await shopifyGraphQL(RETURN_CREATE_MUTATION, {
     returnInput: input,
   });
@@ -552,51 +550,33 @@ async function createShopifyReturn(orderId, returnLineItems) {
     return { ok: false, errors: createErrors };
   }
 
-  const returnId = createPayload?.return?.id;
-  if (!returnId) {
+  const returnData = createPayload?.return;
+  if (!returnData?.id) {
     return {
       ok: false,
       errors: [{ message: "Return created but no ID returned." }],
     };
   }
 
-  // Step 2: Auto-approve + notify customer
-  console.log("Auto-approving return and notifying customer...");
+  // API-initiated returns come back with status "OPEN" = already approved.
+  const normalizedStatus = String(returnData.status || "").toUpperCase();
+  const autoApproved = normalizedStatus === "OPEN";
 
-  const approveData = await shopifyGraphQL(RETURN_APPROVE_MUTATION, {
-    input: {
-      id: returnId,
-      notifyCustomer: true,
-    },
-  });
+  console.log(
+    `Return created — id: ${returnData.id}, name: ${returnData.name}, ` +
+      `status: ${returnData.status}, autoApproved: ${autoApproved}`
+  );
 
-  const approvePayload = approveData?.returnApproveRequest;
-  const approveErrors = approvePayload?.userErrors || [];
-
-  if (approveErrors.length > 0) {
-    // Return was created successfully, but approval failed.
-    // Log the error, but don't fail the whole request.
-    // The merchant can manually approve in Shopify Admin.
-    console.warn("Return created but auto-approve failed:", approveErrors);
-    return {
-      ok: true,
-      returnData: createPayload?.return,
-      autoApproved: false,
-      approvalError: approveErrors[0]?.message || "Approval failed.",
-    };
-  }
-
-  console.log("Return auto-approved successfully.");
   return {
     ok: true,
-    returnData: approvePayload?.return || createPayload?.return,
-    autoApproved: true,
+    returnData,
+    autoApproved,
   };
 }
 
 /**
  * ============================================================
- * EMAIL NOTIFICATION
+ * EMAIL NOTIFICATIONS
  * ============================================================
  */
 
@@ -628,10 +608,10 @@ async function sendMerchantNotification({ order, returnData, items }) {
     .map(
       (i) => `
         <tr>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${i.title || ""}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">${i.quantity}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${i.reason || ""}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${i.note || "—"}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;">${escapeHtml(i.title || "")}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">${escapeHtml(i.quantity)}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;">${escapeHtml(i.reason || "")}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;">${escapeHtml(i.note || "—")}</td>
         </tr>`
     )
     .join("");
@@ -642,22 +622,22 @@ async function sendMerchantNotification({ order, returnData, items }) {
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333;">
       <h2 style="margin:0 0 16px;">New return request (auto-approved)</h2>
       <p>
-        A customer has submitted a return request for <strong>${storeName}</strong>.
+        A customer has submitted a return request for <strong>${escapeHtml(storeName)}</strong>.
         The return has been <strong>automatically approved</strong> because it falls within the 7-day return window.
       </p>
 
       <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;">
         <tr>
           <td style="padding:8px;background:#f5f5f5;width:160px;"><strong>Order</strong></td>
-          <td style="padding:8px;">${order.name || ""}</td>
+          <td style="padding:8px;">${escapeHtml(order.name || "")}</td>
         </tr>
         <tr>
           <td style="padding:8px;background:#f5f5f5;"><strong>Return</strong></td>
-          <td style="padding:8px;">${returnName}</td>
+          <td style="padding:8px;">${escapeHtml(returnName)}</td>
         </tr>
         <tr>
           <td style="padding:8px;background:#f5f5f5;"><strong>Customer</strong></td>
-          <td style="padding:8px;">${customerDisplay}</td>
+          <td style="padding:8px;">${escapeHtml(customerDisplay)}</td>
         </tr>
       </table>
 
@@ -689,7 +669,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
       ${
         orderLink
           ? `<p style="margin-top:24px;">
-              <a href="${orderLink}" style="display:inline-block;padding:10px 20px;background:#121212;color:#fff;text-decoration:none;border-radius:4px;">
+              <a href="${escapeHtml(orderLink)}" style="display:inline-block;padding:10px 20px;background:#121212;color:#fff;text-decoration:none;border-radius:4px;">
                 View in Shopify Admin
               </a>
             </p>`
@@ -697,7 +677,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
       }
 
       <p style="margin-top:24px;font-size:12px;color:#888;">
-        This is an automated notification from ${storeName}.
+        This is an automated notification from ${escapeHtml(storeName)}.
       </p>
     </div>
   `;
@@ -741,6 +721,175 @@ ${orderLink ? `View: ${orderLink}` : ""}
     return { ok: true, id: result?.data?.id };
   } catch (err) {
     console.error("Resend send failed:", err);
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Send customer confirmation email via Resend.
+ *
+ * This is the customer's written record of their return request.
+ * Shopify's native return notification may not fire for API-initiated
+ * returns, so we send our own confirmation here.
+ */
+async function sendCustomerConfirmation({
+  order,
+  returnData,
+  items,
+  autoApproved,
+}) {
+  console.log("=== sendCustomerConfirmation START ===");
+
+  const fromEmail = process.env.FROM_EMAIL;
+  const storeName = process.env.STORE_NAME || "Store";
+  const supportEmail = process.env.SUPPORT_EMAIL || fromEmail;
+  const customerEmail = normalizeEmail(order.email);
+
+  if (!customerEmail || !fromEmail || !process.env.RESEND_API_KEY) {
+    console.warn(
+      "Customer confirmation skipped — missing env vars or email."
+    );
+    return { skipped: true };
+  }
+
+  const returnName = returnData?.name || "Return";
+  const orderName = order.name || "";
+
+  const itemsHtml = items
+    .map(
+      (i) => `
+        <tr>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;font-size:14px;">${escapeHtml(i.title || "")}</td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;text-align:center;font-size:14px;">${escapeHtml(i.quantity)}</td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;font-size:14px;">${escapeHtml(i.reason || "")}</td>
+        </tr>`
+    )
+    .join("");
+
+  const approvalLine = autoApproved
+    ? `<p style="margin:0 0 16px;">
+         Your return has been <strong>approved</strong>. Please follow the shipping
+         instructions below to send the item(s) back to us.
+       </p>`
+    : `<p style="margin:0 0 16px;">
+         Your return request has been received and is currently
+         <strong>under review</strong>. We'll notify you once it's approved.
+       </p>`;
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333;">
+      <h2 style="margin:0 0 16px;">We received your return request</h2>
+
+      <p style="margin:0 0 16px;">
+        Hi${order.email ? "" : " there"}, thanks for reaching out. This is a
+        confirmation that we've received your return request for order
+        <strong>${escapeHtml(orderName)}</strong>.
+      </p>
+
+      ${approvalLine}
+
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;">
+        <tr>
+          <td style="padding:8px;background:#f5f5f5;width:160px;"><strong>Order</strong></td>
+          <td style="padding:8px;">${escapeHtml(orderName)}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px;background:#f5f5f5;"><strong>Return reference</strong></td>
+          <td style="padding:8px;">${escapeHtml(returnName)}</td>
+        </tr>
+      </table>
+
+      <h3 style="margin:24px 0 8px;font-size:16px;">Items in this return</h3>
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <thead>
+          <tr style="background:#f5f5f5;">
+            <th style="padding:8px;text-align:left;">Item</th>
+            <th style="padding:8px;text-align:center;">Qty</th>
+            <th style="padding:8px;text-align:left;">Reason</th>
+          </tr>
+        </thead>
+        <tbody>${itemsHtml}</tbody>
+      </table>
+
+      <h3 style="margin:24px 0 8px;font-size:16px;">Return instructions</h3>
+      <ul style="margin:8px 0 16px;padding-left:20px;font-size:14px;line-height:1.6;">
+        <li>Pack the item(s) securely in the original packaging if possible.</li>
+        <li>Include this order number <strong>${escapeHtml(orderName)}</strong> inside the package.</li>
+        <li>Ship the package to the return address provided by our support team.</li>
+        <li>Customer is responsible for return shipping costs.</li>
+      </ul>
+
+      <div style="background:#fff3cd;border:1px solid #ffc107;padding:12px;border-radius:4px;margin:16px 0;font-size:13px;line-height:1.6;">
+        <strong>⚠️ Reminders:</strong>
+        <ul style="margin:8px 0 0;padding-left:20px;">
+          <li>Return window: 7 days from delivery.</li>
+          <li>Refunds are processed within 2–5 business days after we receive and inspect the item.</li>
+          <li>Original shipping costs are non-refundable.</li>
+          <li>Damaged or defective items must be reported within 48 hours of delivery.</li>
+        </ul>
+      </div>
+
+      <p style="margin:16px 0 0;font-size:14px;">
+        Questions? Just reply to this email${
+          supportEmail
+            ? ` or contact us at <a href="mailto:${escapeHtml(supportEmail)}" style="color:#121212;">${escapeHtml(supportEmail)}</a>`
+            : ""
+        }.
+      </p>
+
+      <p style="margin-top:24px;font-size:12px;color:#888;">
+        This is an automated confirmation from ${escapeHtml(storeName)}.
+      </p>
+    </div>
+  `;
+
+  const text = `
+We received your return request
+
+Order: ${orderName}
+Return reference: ${returnName}
+
+${autoApproved ? "Your return has been approved." : "Your return is currently under review."}
+
+Items:
+${items
+  .map((i) => `- ${i.title} (Qty ${i.quantity}) — ${i.reason}`)
+  .join("\n")}
+
+Return instructions:
+- Pack the item(s) securely.
+- Include the order number ${orderName} inside the package.
+- Ship to the return address provided by our support team.
+- Customer is responsible for return shipping costs.
+
+Reminders:
+- Return window: 7 days from delivery.
+- Refunds processed within 2-5 business days after inspection.
+- Original shipping costs are non-refundable.
+- Damaged/defective items must be reported within 48 hours of delivery.
+
+This is an automated confirmation from ${storeName}.
+  `.trim();
+
+  try {
+    const result = await resend.emails.send({
+      from: `${storeName} <${fromEmail}>`,
+      to: customerEmail,
+      replyTo: supportEmail || undefined,
+      subject: `We received your return request — ${orderName}`,
+      html,
+      text,
+    });
+
+    if (result?.error) {
+      console.error("Resend returned error (customer):", result.error);
+      return { ok: false, error: result.error };
+    }
+
+    console.log("Customer confirmation sent:", result?.data?.id);
+    return { ok: true, id: result?.data?.id };
+  } catch (err) {
+    console.error("Resend send failed (customer):", err);
     return { ok: false, error: err.message };
   }
 }
@@ -824,7 +973,9 @@ function serializeOrder(order) {
  * Returns order details with eligibility markers per item.
  */
 async function handleLookup(res, body) {
-  const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
+  const orderNumber = normalizeOrderNumber(
+    body.orderNumber || body.order_number
+  );
   const email = normalizeEmail(body.email);
 
   // Validate inputs
@@ -881,13 +1032,17 @@ async function handleLookup(res, body) {
 }
 
 /**
- * SUBMIT — create Shopify return + auto-approve + notify merchant.
+ * SUBMIT — create Shopify return + notify merchant + customer.
  *
  * Eligibility is double-checked here even though the frontend
  * only shows eligible items, to prevent bypassing the policy.
+ *
+ * API-initiated returns are created with status "OPEN" = auto-approved.
  */
 async function handleSubmit(res, body) {
-  const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
+  const orderNumber = normalizeOrderNumber(
+    body.orderNumber || body.order_number
+  );
   const email = normalizeEmail(body.email);
   const items = Array.isArray(body.items) ? body.items : [];
 
@@ -997,7 +1152,8 @@ async function handleSubmit(res, body) {
     });
   }
 
-  // Step 4: Create return + auto-approve + notify customer
+  // Step 4: Create return in Shopify
+  // API-initiated returns come back as "OPEN" = already approved.
   let result;
   try {
     result = await createShopifyReturn(order.id, returnLineItems);
@@ -1030,7 +1186,20 @@ async function handleSubmit(res, body) {
     // Hindi fatal — successful pa rin ang return
   }
 
-  // Step 6: Respond to customer
+  // Step 6: Notify customer via Resend (non-blocking)
+  try {
+    await sendCustomerConfirmation({
+      order,
+      returnData: result.returnData,
+      items,
+      autoApproved: result.autoApproved || false,
+    });
+  } catch (err) {
+    console.error("Customer confirmation error:", err);
+    // Hindi fatal — successful pa rin ang return
+  }
+
+  // Step 7: Respond to customer
   return sendJson(res, 200, {
     ok: true,
     message: result.autoApproved
