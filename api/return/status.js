@@ -537,7 +537,7 @@ async function createAndApproveReturn(orderId, returnLineItems) {
 /**
  * Send merchant notification email via Resend.
  *
- * Includes product image thumbnails for each returned item.
+ * Includes product image thumbnails and per-item customer notes.
  */
 async function sendMerchantNotification({ order, returnData, items }) {
   console.log("=== sendMerchantNotification START ===");
@@ -556,7 +556,8 @@ async function sendMerchantNotification({ order, returnData, items }) {
   const orderLink = adminUrl ? `${adminUrl}/orders/${orderId}` : "";
   const returnName = returnData?.name || "Return";
 
-  // Build items table with image thumbnails.
+  // Build items table with image thumbnails and notes.
+  // `i.note` is the normalized field name (mapped from frontend `details`).
   const itemsHtml = items
     .map((i) => {
       const imgUrl = i.image && i.image.url ? i.image.url : "";
@@ -907,16 +908,23 @@ async function handleSubmit(res, body) {
       match.availableQuantity
     );
 
+    const noteText = (requestedItem.details || "").slice(0, 300);
+
     returnLineItems.push({
       fulfillmentLineItemId: match.fulfillmentLineItemId,
       quantity: qty,
       returnReason: mapReturnReason(requestedItem.reason),
-      customerNote: (requestedItem.details || "").slice(0, 300),
+      customerNote: noteText,
     });
 
-    // Enrich the item with the image from Shopify for the email.
+    // Enrich the item with the image from Shopify and normalize
+    // the note field name (`details` → `note`) for the email template.
     enrichedItems.push({
-      ...requestedItem,
+      item_id: requestedItem.item_id,
+      title: requestedItem.title || match.title,
+      quantity: qty,
+      reason: requestedItem.reason,
+      note: noteText,
       image: match.image || null,
     });
   }
@@ -942,7 +950,7 @@ async function handleSubmit(res, body) {
   console.log("Return created successfully:", result.returnData);
 
   // Notify merchant via Resend (non-blocking)
-  // Use enrichedItems so the email can render product image thumbnails.
+  // Uses enrichedItems so the email includes images and notes.
   try {
     await sendMerchantNotification({
       order,
